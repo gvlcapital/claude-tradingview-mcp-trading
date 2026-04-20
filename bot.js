@@ -13,12 +13,189 @@ import "dotenv/config";
 import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
 import crypto from "crypto";
 import { execSync } from "child_process";
+import TelegramBot from "node-telegram-bot-api";
+
+// Railway sets RAILWAY_ENVIRONMENT automatically; use it to detect cron/cloud mode
+const IS_CRON = !!process.env.RAILWAY_ENVIRONMENT;
+
+// ─── Telegram ─────────────────────────────────────────────────────────────────
+
+const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+let tgBot = null;
+
+function initTelegram() {
+  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.log("⚠️  Telegram not configured — skipping notifications.");
+    return;
+  }
+  tgBot = new TelegramBot(TELEGRAM_TOKEN, { polling: !IS_CRON });
+  console.log("✅ Telegram bot connected");
+
+  if (IS_CRON) return; // cron mode — send-only, no interactive command handlers
+
+  // /start
+  tgBot.onText(/\/start/, (msg) => {
+    tgBot.sendMessage(
+      msg.chat.id,
+      `👋 *GVL Trading Bot online*\n\nCommands:\n/status — live marktdata\n/run — bot handmatig triggeren\n/summary — trade overzicht`,
+      { parse_mode: "Markdown" },
+    );
+  });
+
+  // /status — haal live data op en stuur terug
+  tgBot.onText(/\/status/, async (msg) => {
+    tgBot.sendMessage(msg.chat.id, "⏳ Marktdata ophalen...");
+    try {
+      const candles = await fetchCandles(CONFIG.symbol, CONFIG.timeframe, 500);
+      const closes = candles.map((c) => c.close);
+      const price = closes[closes.length - 1];
+      const ema8 = calcEMA(closes, 8);
+      const vwap = calcVWAP(candles);
+      const rsi3 = calcRSI(closes, 3);
+
+      const bullish = price > vwap && price > ema8;
+      const bearish = price < vwap && price < ema8;
+      const biasEmoji = bullish
+        ? "🟢 BULLISH"
+        : bearish
+          ? "🔴 BEARISH"
+          : "⚪️ NEUTRAL";
+
+      tgBot.sendMessage(
+        msg.chat.id,
+        `📊 *${CONFIG.symbol} — ${CONFIG.timeframe}*\n\n` +
+          `💰 Prijs:   $${price.toFixed(2)}\n` +
+          `📈 EMA(8): $${ema8.toFixed(2)}\n` +
+          `📊 VWAP:  $${vwap ? vwap.toFixed(2) : "N/A"}\n` +
+          `⚡ RSI(3): ${rsi3 ? rsi3.toFixed(2) : "N/A"}\n\n` +
+          `Bias: ${biasEmoji}`,
+        { parse_mode: "Markdown" },
+      );
+    } catch (err) {
+      tgBot.sendMessage(msg.chat.id, `❌ Fout: ${err.message}`);
+    }
+  });
+
+  // /run — bot handmatig triggeren
+  tgBot.onText(/\/run/, async (msg) => {
+    tgBot.sendMessage(msg.chat.id, "🤖 Bot handmatig gestart...");
+    await run(false); // false = geen polling stop na run
+  });
+
+  // /summary — trade overzicht
+  tgBot.onText(/\/summary/, (msg) => {
+    if (!existsSync(CSV_FILE)) {
+      tgBot.sendMessage(msg.chat.id, "Nog geen trades gelogd.");
+      return;
+    }
+    const lines = readFileSync(CSV_FILE, "utf8").trim().split("\n");
+    const rows = lines.slice(1).map((l) => l.split(","));
+    const live = rows.filter((r) => r[11] === "LIVE").length;
+    const paper = rows.filter((r) => r[11] === "PAPER").length;
+    const blocked = rows.filter((r) => r[11] === "BLOCKED").length;
+
+    tgBot.sendMessage(
+      msg.chat.id,
+      `📋 *Trade overzicht*\n\n` +
+        `✅ Live trades: ${live}\n` +
+        `📋 Paper trades: ${paper}\n` +
+        `🚫 Geblokkeerd: ${blocked}\n` +
+        `📁 Totaal: ${rows.length}`,
+      { parse_mode: "Markdown" },
+    );
+  });
+}
+
+async function sendTelegram(message) {
+  if (!tgBot || !TELEGRAM_CHAT_ID) return;
+  try {
+    await tgBot.sendMessage(TELEGRAM_CHAT_ID, message, {
+      parse_mode: "Markdown",
+    });
+  } catch (err) {
+    console.log(`⚠️  Telegram melding mislukt: ${err.message}`);
+  }
+}
+
+// Stuur een trade signaal met inline knoppen — wacht op goedkeuring
+async function sendTradeConfirmation(price, tradeSize, symbol) {
+  if (!tgBot || !TELEGRAM_CHAT_ID) return true; // geen Telegram = auto-approve
+
+  // Cron mode: can't wait for human input — auto-approve paper, reject live
+  if (IS_CRON) {
+    if (CONFIG.paperTrading) {
+      await sendTelegram(
+        `🤖 *Paper trade auto-approved*\n\n` +
+          `${symbol} BUY @ $${price.toFixed(2)}\n` +
+          `Bedrag: $${tradeSize.toFixed(2)}`,
+      );
+      return true;
+    }
+    await sendTelegram(
+      `⚠️ Live trade auto-rejected in cron mode.\n` +
+        `Set PAPER_TRADING=true or run locally to approve trades manually.`,
+    );
+    return false;
+  }
+
+  return new Promise((resolve) => {
+    const keyboard = {
+      inline_keyboard: [
+        [
+          { text: "✅ Goedkeuren", callback_data: "approve" },
+          { text: "❌ Afwijzen", callback_data: "reject" },
+        ],
+      ],
+    };
+
+    tgBot.sendMessage(
+      TELEGRAM_CHAT_ID,
+      `🚨 *TRADE SIGNAAL*\n\n` +
+        `Symbol: ${symbol}\n` +
+        `Prijs: $${price.toFixed(2)}\n` +
+        `Bedrag: $${tradeSize.toFixed(2)}\n` +
+        `Mode: ${CONFIG.paperTrading ? "📋 PAPER" : "🔴 LIVE"}\n\n` +
+        `Wil je deze trade uitvoeren?`,
+      { parse_mode: "Markdown", reply_markup: keyboard },
+    );
+
+    // Timeout na 60 seconden — geen reactie = afwijzen
+    const timeout = setTimeout(() => {
+      tgBot.sendMessage(TELEGRAM_CHAT_ID, "⏱ Timeout — trade afgewezen.");
+      resolve(false);
+    }, 60000);
+
+    tgBot.once("callback_query", (query) => {
+      clearTimeout(timeout);
+      tgBot.answerCallbackQuery(query.id);
+      if (query.data === "approve") {
+        tgBot.sendMessage(TELEGRAM_CHAT_ID, "✅ Trade goedgekeurd!");
+        resolve(true);
+      } else {
+        tgBot.sendMessage(TELEGRAM_CHAT_ID, "❌ Trade afgewezen.");
+        resolve(false);
+      }
+    });
+  });
+}
 
 // ─── Onboarding ───────────────────────────────────────────────────────────────
 
 function checkOnboarding() {
   const required = ["BITGET_API_KEY", "BITGET_SECRET_KEY", "BITGET_PASSPHRASE"];
   const missing = required.filter((k) => !process.env[k]);
+
+  if (IS_CRON) {
+    // Railway provides env vars via the dashboard — no .env file present
+    if (missing.length > 0) {
+      console.log(`\n⚠️  Missing env vars: ${missing.join(", ")}`);
+      console.log("Set these in the Railway dashboard under Variables.");
+      process.exit(1);
+    }
+    return;
+  }
 
   if (!existsSync(".env")) {
     console.log(
@@ -38,7 +215,11 @@ function checkOnboarding() {
         "MAX_TRADES_PER_DAY=3",
         "PAPER_TRADING=true",
         "SYMBOL=BTCUSDT",
-        "TIMEFRAME=4H",
+        "TIMEFRAME=1m",
+        "",
+        "# Telegram",
+        "TELEGRAM_BOT_TOKEN=",
+        "TELEGRAM_CHAT_ID=",
       ].join("\n") + "\n",
     );
     try {
@@ -60,7 +241,6 @@ function checkOnboarding() {
     process.exit(0);
   }
 
-  // Always print the CSV location so users know where to find their trade log
   const csvPath = new URL("trades.csv", import.meta.url).pathname;
   console.log(`\n📄 Trade log: ${csvPath}`);
   console.log(
@@ -73,7 +253,7 @@ function checkOnboarding() {
 
 const CONFIG = {
   symbol: process.env.SYMBOL || "BTCUSDT",
-  timeframe: process.env.TIMEFRAME || "4H",
+  timeframe: process.env.TIMEFRAME || "1m",
   portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "1000"),
   maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "100"),
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "3"),
@@ -110,7 +290,6 @@ function countTodaysTrades(log) {
 // ─── Market Data (Binance public API — free, no auth) ───────────────────────
 
 async function fetchCandles(symbol, interval, limit = 100) {
-  // Map our timeframe format to Binance interval format
   const intervalMap = {
     "1m": "1m",
     "3m": "3m",
@@ -123,12 +302,10 @@ async function fetchCandles(symbol, interval, limit = 100) {
     "1W": "1w",
   };
   const binanceInterval = intervalMap[interval] || "1m";
-
   const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceInterval}&limit=${limit}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Binance API error: ${res.status}`);
   const data = await res.json();
-
   return data.map((k) => ({
     time: k[0],
     open: parseFloat(k[1]),
@@ -166,7 +343,6 @@ function calcRSI(closes, period = 14) {
   return 100 - 100 / (1 + rs);
 }
 
-// VWAP — session-based, resets at midnight UTC
 function calcVWAP(candles) {
   const midnightUTC = new Date();
   midnightUTC.setUTCHours(0, 0, 0, 0);
@@ -194,38 +370,29 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
 
   console.log("\n── Safety Check ─────────────────────────────────────────\n");
 
-  // Determine bias first
   const bullishBias = price > vwap && price > ema8;
   const bearishBias = price < vwap && price < ema8;
 
   if (bullishBias) {
     console.log("  Bias: BULLISH — checking long entry conditions\n");
-
-    // 1. Price above VWAP
     check(
       "Price above VWAP (buyers in control)",
       `> ${vwap.toFixed(2)}`,
       price.toFixed(2),
       price > vwap,
     );
-
-    // 2. Price above EMA(8)
     check(
       "Price above EMA(8) (uptrend confirmed)",
       `> ${ema8.toFixed(2)}`,
       price.toFixed(2),
       price > ema8,
     );
-
-    // 3. RSI(3) pullback
     check(
       "RSI(3) below 30 (snap-back setup in uptrend)",
       "< 30",
       rsi3.toFixed(2),
       rsi3 < 30,
     );
-
-    // 4. Not overextended from VWAP
     const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
     check(
       "Price within 1.5% of VWAP (not overextended)",
@@ -235,28 +402,24 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
     );
   } else if (bearishBias) {
     console.log("  Bias: BEARISH — checking short entry conditions\n");
-
     check(
       "Price below VWAP (sellers in control)",
       `< ${vwap.toFixed(2)}`,
       price.toFixed(2),
       price < vwap,
     );
-
     check(
       "Price below EMA(8) (downtrend confirmed)",
       `< ${ema8.toFixed(2)}`,
       price.toFixed(2),
       price < ema8,
     );
-
     check(
       "RSI(3) above 70 (reversal setup in downtrend)",
       "> 70",
       rsi3.toFixed(2),
       rsi3 > 70,
     );
-
     const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
     check(
       "Price within 1.5% of VWAP (not overextended)",
@@ -282,36 +445,29 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
 
 function checkTradeLimits(log) {
   const todayCount = countTodaysTrades(log);
-
   console.log("\n── Trade Limits ─────────────────────────────────────────\n");
-
   if (todayCount >= CONFIG.maxTradesPerDay) {
     console.log(
       `🚫 Max trades per day reached: ${todayCount}/${CONFIG.maxTradesPerDay}`,
     );
     return false;
   }
-
   console.log(
     `✅ Trades today: ${todayCount}/${CONFIG.maxTradesPerDay} — within limit`,
   );
-
   const tradeSize = Math.min(
     CONFIG.portfolioValue * 0.01,
     CONFIG.maxTradeSizeUSD,
   );
-
   if (tradeSize > CONFIG.maxTradeSizeUSD) {
     console.log(
       `🚫 Trade size $${tradeSize.toFixed(2)} exceeds max $${CONFIG.maxTradeSizeUSD}`,
     );
     return false;
   }
-
   console.log(
     `✅ Trade size: $${tradeSize.toFixed(2)} — within max $${CONFIG.maxTradeSizeUSD}`,
   );
-
   return true;
 }
 
@@ -346,7 +502,6 @@ async function placeBitGetOrder(symbol, side, sizeUSD, price) {
   });
 
   const signature = signBitGet(timestamp, "POST", path, body);
-
   const res = await fetch(`${CONFIG.bitget.baseUrl}${path}`, {
     method: "POST",
     headers: {
@@ -360,10 +515,8 @@ async function placeBitGetOrder(symbol, side, sizeUSD, price) {
   });
 
   const data = await res.json();
-  if (data.code !== "00000") {
+  if (data.code !== "00000")
     throw new Error(`BitGet order failed: ${data.msg}`);
-  }
-
   return data.data;
 }
 
@@ -371,16 +524,6 @@ async function placeBitGetOrder(symbol, side, sizeUSD, price) {
 
 const CSV_FILE = "trades.csv";
 
-// Always ensure trades.csv exists with headers — open it in Excel/Sheets any time
-function initCsv() {
-  if (!existsSync(CSV_FILE)) {
-    const funnyNote = `,,,,,,,,,,,"NOTE","Hey, if you're at this stage of the video, you must be enjoying it... perhaps you could hit subscribe now? :)"`;
-    writeFileSync(CSV_FILE, CSV_HEADERS + "\n" + funnyNote + "\n");
-    console.log(
-      `📄 Created ${CSV_FILE} — open in Google Sheets or Excel to track trades.`,
-    );
-  }
-}
 const CSV_HEADERS = [
   "Date",
   "Time (UTC)",
@@ -397,19 +540,26 @@ const CSV_HEADERS = [
   "Notes",
 ].join(",");
 
+function initCsv() {
+  if (!existsSync(CSV_FILE)) {
+    const funnyNote = `,,,,,,,,,,,"NOTE","Hey, if you're at this stage of the video, you must be enjoying it... perhaps you could hit subscribe now? :)"`;
+    writeFileSync(CSV_FILE, CSV_HEADERS + "\n" + funnyNote + "\n");
+  }
+}
+
 function writeTradeCsv(logEntry) {
   const now = new Date(logEntry.timestamp);
   const date = now.toISOString().slice(0, 10);
   const time = now.toISOString().slice(11, 19);
 
-  let side = "";
-  let quantity = "";
-  let totalUSD = "";
-  let fee = "";
-  let netAmount = "";
-  let orderId = "";
-  let mode = "";
-  let notes = "";
+  let side = "",
+    quantity = "",
+    totalUSD = "",
+    fee = "",
+    netAmount = "",
+    orderId = "",
+    mode = "",
+    notes = "";
 
   if (!logEntry.allPass) {
     const failed = logEntry.conditions
@@ -455,31 +605,23 @@ function writeTradeCsv(logEntry) {
     `"${notes}"`,
   ].join(",");
 
-  if (!existsSync(CSV_FILE)) {
-    writeFileSync(CSV_FILE, CSV_HEADERS + "\n");
-  }
-
+  if (!existsSync(CSV_FILE)) writeFileSync(CSV_FILE, CSV_HEADERS + "\n");
   appendFileSync(CSV_FILE, row + "\n");
   console.log(`Tax record saved → ${CSV_FILE}`);
 }
 
-// Tax summary command: node bot.js --tax-summary
 function generateTaxSummary() {
   if (!existsSync(CSV_FILE)) {
-    console.log("No trades.csv found — no trades have been recorded yet.");
+    console.log("No trades.csv found.");
     return;
   }
-
   const lines = readFileSync(CSV_FILE, "utf8").trim().split("\n");
   const rows = lines.slice(1).map((l) => l.split(","));
-
   const live = rows.filter((r) => r[11] === "LIVE");
   const paper = rows.filter((r) => r[11] === "PAPER");
   const blocked = rows.filter((r) => r[11] === "BLOCKED");
-
   const totalVolume = live.reduce((sum, r) => sum + parseFloat(r[7] || 0), 0);
   const totalFees = live.reduce((sum, r) => sum + parseFloat(r[8] || 0), 0);
-
   console.log("\n── Tax Summary ──────────────────────────────────────────\n");
   console.log(`  Total decisions logged : ${rows.length}`);
   console.log(`  Live trades executed   : ${live.length}`);
@@ -487,15 +629,15 @@ function generateTaxSummary() {
   console.log(`  Blocked by safety check: ${blocked.length}`);
   console.log(`  Total volume (USD)     : $${totalVolume.toFixed(2)}`);
   console.log(`  Total fees paid (est.) : $${totalFees.toFixed(4)}`);
-  console.log(`\n  Full record: ${CSV_FILE}`);
   console.log("─────────────────────────────────────────────────────────\n");
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
-async function run() {
+async function run(stopPollingAfter = true) {
   checkOnboarding();
   initCsv();
+
   console.log("═══════════════════════════════════════════════════════════");
   console.log("  Claude Trading Bot");
   console.log(`  ${new Date().toISOString()}`);
@@ -504,27 +646,24 @@ async function run() {
   );
   console.log("═══════════════════════════════════════════════════════════");
 
-  // Load strategy
   const rules = JSON.parse(readFileSync("rules.json", "utf8"));
   console.log(`\nStrategy: ${rules.strategy.name}`);
   console.log(`Symbol: ${CONFIG.symbol} | Timeframe: ${CONFIG.timeframe}`);
 
-  // Load log and check daily limits
   const log = loadLog();
   const withinLimits = checkTradeLimits(log);
   if (!withinLimits) {
     console.log("\nBot stopping — trade limits reached for today.");
+    await sendTelegram("🚫 Bot gestopt — daglimiet bereikt.");
     return;
   }
 
-  // Fetch candle data — need enough for EMA(8) + full session for VWAP
   console.log("\n── Fetching market data from Binance ───────────────────\n");
   const candles = await fetchCandles(CONFIG.symbol, CONFIG.timeframe, 500);
   const closes = candles.map((c) => c.close);
   const price = closes[closes.length - 1];
   console.log(`  Current price: $${price.toFixed(2)}`);
 
-  // Calculate indicators
   const ema8 = calcEMA(closes, 8);
   const vwap = calcVWAP(candles);
   const rsi3 = calcRSI(closes, 3);
@@ -538,16 +677,12 @@ async function run() {
     return;
   }
 
-  // Run safety check
   const { results, allPass } = runSafetyCheck(price, ema8, vwap, rsi3, rules);
-
-  // Calculate position size
   const tradeSize = Math.min(
     CONFIG.portfolioValue * 0.01,
     CONFIG.maxTradeSizeUSD,
   );
 
-  // Decision
   console.log("\n── Decision ─────────────────────────────────────────────\n");
 
   const logEntry = {
@@ -572,18 +707,42 @@ async function run() {
   if (!allPass) {
     const failed = results.filter((r) => !r.pass).map((r) => r.label);
     console.log(`🚫 TRADE BLOCKED`);
-    console.log(`   Failed conditions:`);
     failed.forEach((f) => console.log(`   - ${f}`));
+
+    // Stuur geblokkeerde run ook naar Telegram (elke 10e run om spam te voorkomen)
+    const totalRuns = log.trades.length;
+    if (totalRuns % 10 === 0) {
+      await sendTelegram(
+        `📊 *Bot update* — geen signaal\n\n` +
+          `${CONFIG.symbol} @ $${price.toFixed(2)}\n` +
+          `RSI(3): ${rsi3.toFixed(2)} | EMA(8): $${ema8.toFixed(2)}\n` +
+          `Reden: ${failed[0]}`,
+      );
+    }
   } else {
     console.log(`✅ ALL CONDITIONS MET`);
 
-    if (CONFIG.paperTrading) {
+    // Human in the loop — vraag goedkeuring via Telegram
+    const approved = await sendTradeConfirmation(
+      price,
+      tradeSize,
+      CONFIG.symbol,
+    );
+
+    if (!approved) {
+      console.log("❌ Trade afgewezen via Telegram.");
+      logEntry.orderPlaced = false;
+    } else if (CONFIG.paperTrading) {
       console.log(
         `\n📋 PAPER TRADE — would buy ${CONFIG.symbol} ~$${tradeSize.toFixed(2)} at market`,
       );
-      console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
       logEntry.orderPlaced = true;
       logEntry.orderId = `PAPER-${Date.now()}`;
+      await sendTelegram(
+        `✅ *Paper trade uitgevoerd*\n\n` +
+          `${CONFIG.symbol} BUY @ $${price.toFixed(2)}\n` +
+          `Bedrag: $${tradeSize.toFixed(2)}`,
+      );
     } else {
       console.log(
         `\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} BUY ${CONFIG.symbol}`,
@@ -598,29 +757,52 @@ async function run() {
         logEntry.orderPlaced = true;
         logEntry.orderId = order.orderId;
         console.log(`✅ ORDER PLACED — ${order.orderId}`);
+        await sendTelegram(
+          `🔴 *Live trade uitgevoerd*\n\n` +
+            `${CONFIG.symbol} BUY @ $${price.toFixed(2)}\n` +
+            `Order ID: ${order.orderId}`,
+        );
       } catch (err) {
         console.log(`❌ ORDER FAILED — ${err.message}`);
         logEntry.error = err.message;
+        await sendTelegram(`❌ Order mislukt: ${err.message}`);
       }
     }
   }
 
-  // Save decision log
   log.trades.push(logEntry);
   saveLog(log);
   console.log(`\nDecision log saved → ${LOG_FILE}`);
-
-  // Write tax CSV row for every run (executed, paper, or blocked)
   writeTradeCsv(logEntry);
-
   console.log("═══════════════════════════════════════════════════════════\n");
+
+  // Stop polling when bot has run once (local one-shot mode only)
+  if (stopPollingAfter && tgBot && !IS_CRON) {
+    tgBot.stopPolling();
+  }
 }
+
+// ─── Entry point ─────────────────────────────────────────────────────────────
 
 if (process.argv.includes("--tax-summary")) {
   generateTaxSummary();
 } else {
-  run().catch((err) => {
-    console.error("Bot error:", err);
-    process.exit(1);
-  });
+  initTelegram();
+
+  // Als /run commando gebruikt wordt blijft de bot in polling mode
+  // Anders: eenmalig draaien (cron/Railway mode)
+  if (!process.argv.includes("--listen")) {
+    run()
+      .then(() => {
+        if (IS_CRON) process.exit(0);
+      })
+      .catch((err) => {
+        console.error("Bot error:", err);
+        process.exit(1);
+      });
+  } else {
+    console.log(
+      "🤖 Bot luistert naar Telegram commando's... (Ctrl+C om te stoppen)",
+    );
+  }
 }

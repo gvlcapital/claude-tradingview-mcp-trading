@@ -1,3 +1,5 @@
 Date,Time (UTC),Exchange,Symbol,Side,Quantity,Price,Total USD,Fee (est.),Net Amount,Order ID,Mode,Notes
 ,,,,,,,,,,,"NOTE","Hey, if you're at this stage of the video, you must be enjoying it... perhaps you could hit subscribe now? :)"
 2026-04-20,18:15:01,BitGet,BTCUSDT,,,76282.29,,,,BLOCKED,BLOCKED,"Failed: RSI(3) below 30 (snap-back setup in uptrend); Price within 1.5% of VWAP (not overextended)"
+2026-04-20,18:19:54,BitGet,BTCUSDT,,,76260.64,,,,BLOCKED,BLOCKED,"Failed: Market bias"
+2026-04-20,18:35:08,BitGet,BTCUSDT,,,76124.08,,,,BLOCKED,BLOCKED,"Failed: RSI(3) below 30 (snap-back setup in uptrend)"
